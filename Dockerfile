@@ -1,7 +1,8 @@
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    DB_PATH=/data/energy.db
+    DB_PATH=/data/energy.db \
+    ARCHIVE_DIR=/data/archives
 
 WORKDIR /srv
 COPY requirements.txt .

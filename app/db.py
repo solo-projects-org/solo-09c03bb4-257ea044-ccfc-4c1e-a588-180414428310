@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS batches (
     received_at       TEXT NOT NULL,          -- ISO-8601 UTC
     rows_total        INTEGER NOT NULL,       -- valid rows in the CSV
     rows_inserted     INTEGER NOT NULL,       -- brand-new readings stored
-    rows_deduplicated INTEGER NOT NULL        -- retransmitted identical rows
+    rows_deduplicated INTEGER NOT NULL,       -- retransmitted identical rows
+    archive_sha256    TEXT,                   -- SHA-256 of the raw uploaded bytes
+    archive_size      INTEGER                 -- byte length of the archived CSV
 );
 
 CREATE TABLE IF NOT EXISTS readings (
@@ -67,5 +69,13 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        # Forward migration for databases created before raw-byte archiving:
+        # old batch rows keep NULL archive columns and are reported as not
+        # downloadable by the download endpoint.
+        existing = {r["name"] for r in conn.execute("PRAGMA table_info(batches)")}
+        if "archive_sha256" not in existing:
+            conn.execute("ALTER TABLE batches ADD COLUMN archive_sha256 TEXT")
+        if "archive_size" not in existing:
+            conn.execute("ALTER TABLE batches ADD COLUMN archive_size INTEGER")
     finally:
         conn.close()

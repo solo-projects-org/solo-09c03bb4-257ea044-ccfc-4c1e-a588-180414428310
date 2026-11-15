@@ -1,6 +1,7 @@
-# Two API instances, one shared SQLite database on a named volume.
-# Both containers run on the same Docker host, so WAL-mode file locking
-# serializes writers exactly like two processes on one machine.
+# Two API instances, one shared SQLite database and one shared raw-byte
+# archive on a named volume. Both containers run on the same Docker host, so
+# WAL-mode file locking serializes writers and os.replace publishes archive
+# files atomically exactly like two processes on one machine.
 services:
   api-a:
     build: .
@@ -10,6 +11,7 @@ services:
       - energy-data:/data
     environment:
       DB_PATH: /data/energy.db
+      ARCHIVE_DIR: /data/archives
 
   api-b:
     build: .
@@ -19,6 +21,7 @@ services:
       - energy-data:/data
     environment:
       DB_PATH: /data/energy.db
+      ARCHIVE_DIR: /data/archives
 
 volumes:
   energy-data:

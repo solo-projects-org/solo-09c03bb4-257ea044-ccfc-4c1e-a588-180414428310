@@ -24,6 +24,7 @@ def csv_of(rows: list[tuple[str, int, float]]) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setenv("ARCHIVE_DIR", str(tmp_path / "archives"))
     from app.main import app
     with TestClient(app) as c:
         yield c

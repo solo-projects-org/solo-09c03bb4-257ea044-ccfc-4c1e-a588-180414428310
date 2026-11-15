@@ -4,8 +4,10 @@
 按小时算出**可计费电量**交给计费组复核；迟到读数填补缺口时，前后小时的结果在同一事务里一起更新。
 
 - FastAPI + SQLite（WAL），两个 API 实例共享同一个数据库文件
+- 每个**成功受理的批次**（含全同值重传）都保存上传的**原始字节**与 SHA-256，
+  可按 `batch_id` 原样下载；下载前整文件核验，损坏即报错且不输出部分内容
 - `docker compose up` 一键启动两个实例（`:8001` / `:8002`），Swagger 文档开箱即用
-- 本地样例覆盖：缺口、迟到填洞、重传去重、异值拒批、表码回退、双实例并发补传
+- 本地样例覆盖：缺口、迟到填洞、重传去重、异值拒批、表码回退、双实例并发补传、原件下载核验
 
 ## 快速开始
 
@@ -24,8 +26,10 @@ docker compose up --build
 
 ```bash
 pip install -r requirements-dev.txt
-DB_PATH=./data/energy.db uvicorn app.main:app --port 8001 &
-DB_PATH=./data/energy.db uvicorn app.main:app --port 8002 &
+DB_PATH=./data/energy.db ARCHIVE_DIR=./data/archives \
+  uvicorn app.main:app --port 8001 &
+DB_PATH=./data/energy.db ARCHIVE_DIR=./data/archives \
+  uvicorn app.main:app --port 8002 &
 python -m pytest tests/ -q
 ```
 
@@ -54,10 +58,24 @@ python -m pytest tests/ -q
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/batches` | 上传 CSV 批次：multipart 文件（Swagger 文件选择器）或 `text/csv` 原始体 |
+| `POST` | `/batches` | 上传 CSV 批次：multipart 文件（Swagger 文件选择器）或 `text/csv` 原始体；成功即归档原始字节与 SHA-256 |
+| `GET` | `/batches` | 已接受批次的审计列表（含 `archive_sha256`、`archive_size`、`downloadable`） |
+| `GET` | `/batches/{batch_id}/download` | 下载该批次的 CSV 原件；发送前重新核验整文件 SHA-256 |
 | `GET` | `/readings` | 按 `meter_id` + `from_second`/`to_second`（均为整点秒、闭区间）查原始读数 |
 | `GET` | `/hourly-usage` | 按表和时间窗查小时电量、`billable` 与 `reason`（`ok`/`gap`/`rollback`） |
-| `GET` | `/batches` | 已接受批次的审计列表 |
+
+### 原件归档与下载
+
+- 每个成功受理的批次在 `$ARCHIVE_DIR`（默认 `/data/archives`）下保存
+  `<batch_id>.csv`，即网关上传的**逐字节原件**（BOM、CRLF 等原样保留），
+  并在 `batches` 表记录 SHA-256 与字节数；全同值重传即使 `rows_inserted=0`
+  也拥有各自独立的原件
+- `GET /batches/{batch_id}/download` 先读完整文件、比对记录的字节数与
+  SHA-256，**全部通过后才开始输出**；文件缺失或哈希不符返回 `500`，
+  不会输出任何部分内容，响应头 `X-Content-SHA256` 回传记录的摘要
+- 错误码：未知/非法 `batch_id` → `404`；归档功能上线前的旧批次（无原件）
+  → `410 Gone` 并明确说明不可下载，列表中 `downloadable=false`
+- 校验失败（422）或冲突（409）的批次**不产生任何归档文件**，也不可访问
 
 `POST /batches` 响应示例：
 
@@ -69,7 +87,9 @@ python -m pytest tests/ -q
   "rows_inserted": 2,
   "rows_deduplicated": 0,
   "meters": ["meter-east-01"],
-  "hourly_usage_updated": 3
+  "hourly_usage_updated": 3,
+  "archive_sha256": "afa686c5797a69e255c5d41c6d88b3dcc5f141bfa5bad49ef51cf03be4fa4dfc",
+  "archive_size": 154
 }
 ```
 
@@ -79,6 +99,11 @@ curl 示例：
 curl -F "file=@samples/batch1_initial_with_gap.csv;type=text/csv" http://localhost:8001/batches
 curl -X POST -H "content-type: text/csv" --data-binary @samples/batch2_late_gap_fill.csv http://localhost:8002/batches
 curl "http://localhost:8001/hourly-usage?meter_id=meter-east-01&from_second=1793491200&to_second=1793509200"
+
+# 取回某批次的 CSV 原件并自行核验
+BATCH_ID=86c31ced5dab4429ac3f2c1a7184c94d
+curl -D - -o returned.csv "http://localhost:8001/batches/$BATCH_ID/download"
+sha256sum returned.csv   # 与响应头 X-Content-SHA256 / GET /batches 中的摘要一致
 ```
 
 ## Swagger 导入本地样例
@@ -88,31 +113,47 @@ curl "http://localhost:8001/hourly-usage?meter_id=meter-east-01&from_second=1793
 1. `samples/batch1_initial_with_gap.csv` — 00/01/02/05 点读数，02–05 出现 3 小时缺口
 2. `GET /hourly-usage?meter_id=meter-east-01` — 可见 02/03/04 点 `reason=gap`
 3. `samples/batch2_late_gap_fill.csv` — 迟到的 03/04 点读数；再查可见缺口各小时已变为可计费
-4. `samples/batch3_retransmit_same_values.csv` — 同值重传，`rows_inserted=0`、`rows_deduplicated=2`
-5. `samples/batch4_conflicting_value.csv` — 异值冲突，HTTP 409，已存数据不变
+4. `samples/batch3_retransmit_same_values.csv` — 同值重传，`rows_inserted=0`、`rows_deduplicated=2`，但仍生成独立原件
+5. `samples/batch4_conflicting_value.csv` — 异值冲突，HTTP 409，已存数据与归档目录均不变
 6. `samples/batch5_meter_rollback.csv` — `meter-west-02` 表码回退，对应小时不可计费
 7. `samples/batch6a_concurrent.csv` / `batch6b_concurrent.csv` — 分别发往两个实例（演示并发补传同一表）
+8. `GET /batches` — 复制任一 `batch_id`；在
+   `GET /batches/{batch_id}/download` → **Try it out** 中粘贴并执行，
+   浏览器即下载该批次的 CSV 原件（Swagger 会显示响应头 `X-Content-SHA256`）
 
 ## 并发与一致性设计
 
-两个容器（`api-a`、`api-b`）挂载同一个 named volume，共享 `/data/energy.db`：
+两个容器（`api-a`、`api-b`）挂载同一个 named volume，共享 `/data/energy.db`
+与 `/data/archives`：
 
 - **WAL 模式 + `busy_timeout=30s`**：读写不互斥，写者排队而不是报 `database is locked`
-- **每批一个 `BEGIN IMMEDIATE` 事务**：批次行、原始读数、重算的小时电量一起提交或一起回滚。
-  写者被串行化，因此两个实例同时补传同一表时，成功批次全部保留、不会互相覆盖
+- **每批一个 `BEGIN IMMEDIATE` 事务**：批次行（含原件摘要）、原始读数、重算的
+  小时电量一起提交或一起回滚。写者被串行化，因此两个实例同时补传同一表时，
+  成功批次全部保留、不会互相覆盖
+- **原件先落盘、事务后提交**：上传字节先写入唯一临时文件并 `fsync`，再以
+  `os.replace` 原子发布为 `<batch_id>.csv`（含目录 fsync），然后才开启数据库
+  事务；事务失败/回滚时删除原件。因此不存在"数据库里有成功批次但缺原件"的状态，
+  也不会出现半成品的正式归档文件
+- **进程中断后的启动清扫**：实例启动时删除无批次行引用的旧归档和残留临时文件；
+  只清理超过 1 小时的文件，避免误删另一实例正在写入的在途文件
+- **下载前整文件核验**：先读完整个文件并比对字节数与 SHA-256，通过后才构造
+  响应；文件缺失或损坏返回 500，绝不输出部分内容
 - **查询只读已提交快照**：不会看到"新读数配旧用量"的中间态
-- **校验失败（422）或冲突（409）发生在提交前**：此前完整结果照常可查，失败批次不留痕迹
-- `(meter_id, utc_second)` 主键兜底，同值重传天然幂等
+- **校验失败（422）或冲突（409）发生在提交前**：此前完整结果照常可查，
+  失败批次在数据库与归档目录中都不留痕迹，对外不可访问
+- `(meter_id, utc_second)` 主键兜底，同值重传天然幂等；每次成功重传仍各存一份原件
 
 ## 项目结构
 
 ```
 app/
-  main.py    # FastAPI 路由与请求校验
-  logic.py   # CSV 解析、入库事务、小时电量窗口重算
-  db.py      # SQLite 连接（WAL、busy_timeout）与建表
+  main.py    # FastAPI 路由与请求校验（含 /batches/{id}/download）
+  logic.py   # CSV 解析、原件落盘 + 入库事务、小时电量窗口重算
+  archive.py # 原始字节归档：原子写、fsync、SHA-256 核验、启动清扫
+  db.py      # SQLite 连接（WAL、busy_timeout）、建表与旧库迁移
 samples/     # 本地样例 CSV（缺口/迟到填洞/重传/冲突/回退/并发）
-scripts/demo.sh   # 端到端演示：跑通全部业务场景
-tests/test_app.py # 18 个 pytest 用例（含多线程并发同表补传）
-docker-compose.yml # api-a:8001 + api-b:8002 共享 named volume
+scripts/demo.sh    # 端到端演示：跑通全部业务场景与原件下载核验
+tests/test_app.py     # 18 个 pytest 用例（含多线程并发同表补传）
+tests/test_archive.py # 16 个归档专项用例（核验/拒批/清扫/迁移/并发），共 34 个
+docker-compose.yml # api-a:8001 + api-b:8002 共享 named volume（DB + 归档）
 ```

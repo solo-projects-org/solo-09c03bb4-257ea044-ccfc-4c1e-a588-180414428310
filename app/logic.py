@@ -9,6 +9,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
+from . import archive
 from .db import connect
 
 HOUR = 3600
@@ -95,28 +96,37 @@ def parse_csv(text: str) -> list[tuple[str, int, float]]:
     return rows
 
 
-def ingest(rows: list[tuple[str, int, float]]) -> dict:
+def ingest(rows: list[tuple[str, int, float]], raw: bytes) -> dict:
     """Store one batch and recompute affected hourly usage, atomically.
 
-    The whole batch (readings + batch record + recomputed hours) commits or
-    rolls back together, so a failed batch leaves previously stored results
-    untouched and concurrent readers never see half-written state.
+    The exact uploaded bytes are archived (with their SHA-256) *before* the
+    database transaction starts and the batch row records the digest, so
+    every accepted batch is always backed by a verifiable original. The
+    whole batch (readings + batch record + recomputed hours) commits or
+    rolls back together; on rollback the archived file is removed, so a
+    failed batch leaves previously stored results (and the archive
+    directory) untouched and concurrent readers never see half-written
+    state.
     """
     batch_id = uuid.uuid4().hex
     received_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 1) Durably publish the raw original first; nothing in the DB refers to
+    #    the batch yet, so a failure here has zero side effects elsewhere.
+    archive_sha256, archive_size = archive.store_original(batch_id, raw)
 
     conn = connect()
     inserted = 0
     deduplicated = 0
     hours_written = 0
+    new_per_meter: dict[str, list[int]] = {}
     try:
         conn.execute("BEGIN IMMEDIATE")  # serialize writers across instances
         conn.execute(
             "INSERT INTO batches (batch_id, received_at, rows_total, rows_inserted,"
-            " rows_deduplicated) VALUES (?,?,?,0,0)",
-            (batch_id, received_at, len(rows)))
+            " rows_deduplicated, archive_sha256, archive_size) VALUES (?,?,?,0,0,?,?)",
+            (batch_id, received_at, len(rows), archive_sha256, archive_size))
 
-        new_per_meter: dict[str, list[int]] = {}
         for meter, ts, kwh in rows:
             existing = conn.execute(
                 "SELECT kwh FROM readings WHERE meter_id = ? AND utc_second = ?",
@@ -141,8 +151,14 @@ def ingest(rows: list[tuple[str, int, float]]) -> dict:
             "UPDATE batches SET rows_inserted = ?, rows_deduplicated = ? WHERE batch_id = ?",
             (inserted, deduplicated, batch_id))
         conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
+    except BaseException:
+        # Roll back the database first, then remove the archived original:
+        # no successful batch row may ever point at a missing file.
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        archive.discard_original(batch_id)
         raise
     finally:
         conn.close()
@@ -155,6 +171,8 @@ def ingest(rows: list[tuple[str, int, float]]) -> dict:
         "rows_deduplicated": deduplicated,
         "meters": sorted(new_per_meter),
         "hourly_usage_updated": hours_written,
+        "archive_sha256": archive_sha256,
+        "archive_size": archive_size,
     }
 
 
